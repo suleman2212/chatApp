@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-Time Group Chat</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f4f6f9; }
+        .container { max-width: 600px; margin: 50px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        #chat-page { display: none; max-width: 800px; margin: 20px auto; }
+        #messages { border: 1px solid #e0e0e0; height: 400px; overflow-y: auto; padding: 15px; margin-bottom: 15px; background: #fff; border-radius: 4px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .form-group input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { padding: 10px 20px; border: none; border-radius: 4px; background-color: #007bff; color: white; cursor: pointer; font-size: 14px; }
+        button:hover { background-color: #0056b3; }
+        .btn-secondary { background-color: #6c757d; margin-left: 10px; }
+        .btn-secondary:hover { background-color: #5a6268; }
+        .join-msg { color: #28a745; font-style: italic; margin: 5px 0; }
+        .leave-msg { color: #dc3545; font-style: italic; margin: 5px 0; }
+        .chat-msg { margin: 8px 0; padding: 10px; border-radius: 4px; background: #f8f9fa; border-left: 4px solid #007bff; }
+        .msg-id { font-size: 10px; color: #999; margin-left: 8px; }
+    </style>
+</head>
+<body>
+
+<div id="username-page" class="container">
+    <h2 style="margin-top:0;">Account Access</h2>
+    <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" placeholder="Enter username" />
+    </div>
+    <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" placeholder="Enter password" />
+    </div>
+    <button onclick="handleLogin()">Login</button>
+    <button onclick="handleRegister()" class="btn-secondary">Register Account</button>
+</div>
+
+<div id="chat-page" class="container">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h3 id="welcome-header" style="margin:0;"></h3>
+        <button onclick="handleLogout()" class="btn-secondary" style="padding: 5px 10px; font-size: 12px;">Logout</button>
+    </div>
+    <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
+    <div id="messages"></div>
+    <div style="display:flex; gap:10px;">
+        <input type="text" id="message-input" style="flex:1; padding:10px; border:1px solid #ccc; border-radius:4px;" placeholder="Type a message..." onkeypress="if(event.key === 'Enter') sendMessage()" />
+        <button onclick="sendMessage()">Send</button>
+    </div>
+</div>
+
+<script>
+    let stompClient = null;
+    let username = null;
+
+    window.onload = function() {
+        const savedToken = localStorage.getItem('chat_jwt_token');
+        const savedUsername = localStorage.getItem('chat_username');
+
+        if (savedToken && savedUsername) {
+            username = savedUsername;
+            startChatFlow();
+        }
+    };
+
+    function handleRegister() {
+        const userPayload = getAuthPayload();
+        if (!userPayload) return;
+
+        fetch('/api/auth/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(userPayload)
+        })
+        .then(response => {
+            if (!response.ok) return response.text().then(text => { throw new Error(text) });
+            return response.text();
+        })
+        .then(msg => alert(msg + "! You can now log in."))
+        .catch(err => alert(err.message));
+    }
+
+    function handleLogin() {
+        const userPayload = getAuthPayload();
+        if (!userPayload) return;
+
+        fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(userPayload)
+        })
+        .then(response => {
+            if (!response.ok) throw new Error('Invalid username or password credentials.');
+            return response.json();
+        })
+        .then(responseData => {
+            localStorage.setItem('chat_jwt_token', responseData.token);
+            localStorage.setItem('chat_username', responseData.username);
+            if (responseData.userId) {
+                localStorage.setItem('chat_user_id', responseData.userId);
+            }
+
+            username = responseData.username;
+            startChatFlow();
+        })
+        .catch(err => alert(err.message));
+    }
+
+    function startChatFlow() {
+        document.getElementById('username-page').style.display = 'none';
+        document.getElementById('chat-page').style.display = 'block';
+        document.getElementById('welcome-header').innerText = `Room Active: ${username}`;
+        document.getElementById('messages').innerHTML = '';
+
+        fetch('/chat/history', {
+            headers: { 'Authorization': 'Bearer ' + localStorage.getItem('chat_jwt_token') }
+        })
+        .then(response => {
+            if (response.status === 401 || response.status === 403) {
+                throw new Error('Session expired, please log in again.');
+            }
+            if (!response.ok) return [];
+            return response.json();
+        })
+        .then(historyMessages => {
+            if (Array.isArray(historyMessages)) {
+                historyMessages.forEach(msg => displayMessage(msg));
+            }
+            connectWebSocket();
+        })
+        .catch(err => {
+            alert(err.message);
+            handleLogout();
+        });
+    }
+
+    function connectWebSocket() {
+        const socket = new SockJS('/ws-chat');
+        stompClient = Stomp.over(socket);
+        const token = localStorage.getItem('chat_jwt_token');
+
+        // Token is sent as a STOMP CONNECT header. The server verifies it in
+        // JwtChannelInterceptor before the session is allowed to do anything.
+        stompClient.connect(
+            { Authorization: 'Bearer ' + token },
+            function () {
+                stompClient.subscribe('/topic/public', function (messageOutput) {
+                    displayMessage(JSON.parse(messageOutput.body));
+                });
+                stompClient.send("/app/chat.addUser", {}, JSON.stringify({ sender: username, type: 'JOIN' }));
+            },
+            function () {
+                alert('Could not connect to chat (invalid or expired session).');
+                handleLogout();
+            }
+        );
+    }
+
+    function sendMessage() {
+        const messageContent = document.getElementById('message-input').value.trim();
+        if (messageContent && stompClient) {
+            const chatMessage = {
+                sender: username,
+                content: messageContent,
+                type: 'CHAT'
+            };
+            stompClient.send("/app/chat.sendMessage", {}, JSON.stringify(chatMessage));
+            document.getElementById('message-input').value = '';
+        }
+    }
+
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str == null ? '' : str;
+        return div.innerHTML;
+    }
+
+    function displayMessage(message) {
+        const messageArea = document.getElementById('messages');
+        const messageElement = document.createElement('div');
+
+        if (message.id) {
+            messageElement.setAttribute('data-id', message.id);
+        }
+
+        if (message.type === 'JOIN') {
+            messageElement.classList.add('join-msg');
+            messageElement.innerText = `→ ${message.sender} joined the group`;
+        } else if (message.type === 'LEAVE') {
+            messageElement.classList.add('leave-msg');
+            messageElement.innerText = `← ${message.sender} left the group`;
+        } else {
+            messageElement.classList.add('chat-msg');
+            // sender/content are user-supplied -- escape before injecting as HTML
+            messageElement.innerHTML = `
+                <strong>${escapeHtml(message.sender)}:</strong> ${escapeHtml(message.content)}
+                <span class="msg-id">ID: ${message.id || 'n/a'}${message.userId ? ' | User #' + message.userId : ''}</span>
+            `;
+        }
+
+        messageArea.appendChild(messageElement);
+        messageArea.scrollTop = messageArea.scrollHeight;
+    }
+
+    function handleLogout() {
+        if (stompClient) {
+            try { stompClient.disconnect(); } catch (e) { /* ignore */ }
+        }
+        localStorage.clear();
+        location.reload();
+    }
+
+    function getAuthPayload() {
+        const u = document.getElementById('username').value.trim();
+        const p = document.getElementById('password').value.trim();
+        if (!u || !p) {
+            alert("Please complete both fields.");
+            return null;
+        }
+        return { username: u, password: p };
+    }
+</script>
+</body>
+</html>
